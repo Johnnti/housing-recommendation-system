@@ -51,12 +51,13 @@ class PropertyRecommender:
                     
                     # Add properties and track selected comps
                     selected_comp_ids = set()
-                    for comp in appraisal.get('selected_comps', []):
-                        selected_comp_ids.add(comp['id'])
+                    for comp in appraisal.get('comps', []):
+                        # Use address as identifier since comps don't have 'id'
+                        selected_comp_ids.add(comp.get('address', ''))
                     
                     for prop in appraisal.get('properties', []):
                         prop['appraisal_id'] = i
-                        prop['is_selected_comp'] = prop['id'] in selected_comp_ids
+                        prop['is_selected_comp'] = prop.get('address', '') in selected_comp_ids
                         properties.append(prop)
                     
                     if i % 10 == 0:
@@ -271,6 +272,214 @@ class PropertyRecommender:
             print(f"Error retraining model: {str(e)}")
             print(traceback.format_exc())
 
+    def evaluate(self, subjects_df, properties_df, data, k=10):
+        """
+        Evaluate the recommendation model using multiple metrics.
+        
+        Args:
+            subjects_df: DataFrame of subject properties
+            properties_df: DataFrame of all properties
+            data: Original data dict containing appraisals with selected_comps
+            k: Number of recommendations to evaluate (default 10)
+            
+        Returns:
+            dict: Dictionary containing all evaluation metrics
+        """
+        try:
+            print(f"\n{'='*60}")
+            print("EVALUATING RECOMMENDATION MODEL")
+            print(f"{'='*60}")
+            
+            metrics = {
+                'hit_rate': 0,
+                'precision_at_k': [],
+                'recall_at_k': [],
+                'mrr': [],  # Mean Reciprocal Rank
+                'ndcg_at_k': [],  # Normalized Discounted Cumulative Gain
+                'total_subjects': 0,
+                'subjects_with_hits': 0,
+                'avg_comps_per_subject': 0
+            }
+            
+            total_actual_comps = 0
+            
+            for i, appraisal in enumerate(data['appraisals']):
+                try:
+                    subject = appraisal['subject']
+                    subject_df = pd.DataFrame([subject])
+                    
+                    # Get actual selected comps for this appraisal
+                    actual_comp_ids = set()
+                    for comp in appraisal.get('comps', []):
+                        actual_comp_ids.add(comp.get('address', ''))
+                    
+                    if not actual_comp_ids:
+                        continue
+                    
+                    total_actual_comps += len(actual_comp_ids)
+                    metrics['total_subjects'] += 1
+                    
+                    # Get properties for this appraisal
+                    appraisal_properties = pd.DataFrame(appraisal.get('properties', []))
+                    
+                    if len(appraisal_properties) == 0:
+                        continue
+                    
+                    # Get recommendations
+                    recommendations = self._get_recommendation_indices(
+                        subject_df, appraisal_properties, k
+                    )
+                    
+                    # Get recommended property IDs
+                    recommended_ids = set()
+                    for idx in recommendations:
+                        if idx < len(appraisal_properties):
+                            recommended_ids.add(appraisal_properties.iloc[idx].get('address', ''))
+                    
+                    # Calculate metrics for this subject
+                    hits = recommended_ids & actual_comp_ids
+                    
+                    # Hit Rate (at least one correct comp found)
+                    if len(hits) > 0:
+                        metrics['subjects_with_hits'] += 1
+                    
+                    # Precision@K
+                    precision = len(hits) / k if k > 0 else 0
+                    metrics['precision_at_k'].append(precision)
+                    
+                    # Recall@K
+                    recall = len(hits) / len(actual_comp_ids) if len(actual_comp_ids) > 0 else 0
+                    metrics['recall_at_k'].append(recall)
+                    
+                    # Mean Reciprocal Rank (MRR)
+                    mrr = self._calculate_mrr(recommendations, appraisal_properties, actual_comp_ids)
+                    metrics['mrr'].append(mrr)
+                    
+                    # NDCG@K
+                    ndcg = self._calculate_ndcg(recommendations, appraisal_properties, actual_comp_ids, k)
+                    metrics['ndcg_at_k'].append(ndcg)
+                    
+                    if (i + 1) % 10 == 0:
+                        print(f"Evaluated {i + 1} appraisals...")
+                        
+                except Exception as e:
+                    print(f"Error evaluating appraisal {i}: {str(e)}")
+                    continue
+            
+            # Calculate final metrics
+            if metrics['total_subjects'] > 0:
+                metrics['hit_rate'] = metrics['subjects_with_hits'] / metrics['total_subjects']
+                metrics['avg_precision_at_k'] = np.mean(metrics['precision_at_k']) if metrics['precision_at_k'] else 0
+                metrics['avg_recall_at_k'] = np.mean(metrics['recall_at_k']) if metrics['recall_at_k'] else 0
+                metrics['avg_mrr'] = np.mean(metrics['mrr']) if metrics['mrr'] else 0
+                metrics['avg_ndcg_at_k'] = np.mean(metrics['ndcg_at_k']) if metrics['ndcg_at_k'] else 0
+                metrics['avg_comps_per_subject'] = total_actual_comps / metrics['total_subjects']
+                
+                # Calculate F1 Score
+                if (metrics['avg_precision_at_k'] + metrics['avg_recall_at_k']) > 0:
+                    metrics['f1_score'] = 2 * (metrics['avg_precision_at_k'] * metrics['avg_recall_at_k']) / \
+                                         (metrics['avg_precision_at_k'] + metrics['avg_recall_at_k'])
+                else:
+                    metrics['f1_score'] = 0
+            
+            self._print_evaluation_report(metrics, k)
+            return metrics
+            
+        except Exception as e:
+            print(f"Error during evaluation: {str(e)}")
+            print(traceback.format_exc())
+            raise
+
+    def _get_recommendation_indices(self, subject_df, properties_df, k):
+        """Get indices of top-k recommended properties."""
+        try:
+            # Preprocess data
+            X_subject, X_properties, _ = self.preprocess_data(subject_df, properties_df)
+            
+            # Scale features
+            X_subject_scaled = self.scaler.transform(X_subject)
+            X_properties_scaled = self.scaler.transform(X_properties)
+            
+            # Calculate distances to all properties
+            distances = np.linalg.norm(X_properties_scaled - X_subject_scaled, axis=1)
+            
+            # Get indices of k nearest neighbors
+            indices = np.argsort(distances)[:k]
+            return indices
+            
+        except Exception as e:
+            print(f"Error getting recommendations: {str(e)}")
+            return []
+
+    def _calculate_mrr(self, recommendations, properties_df, actual_comp_ids):
+        """Calculate Mean Reciprocal Rank."""
+        for rank, idx in enumerate(recommendations, 1):
+            if idx < len(properties_df):
+                prop_address = properties_df.iloc[idx].get('address', '')
+                if prop_address in actual_comp_ids:
+                    return 1.0 / rank
+        return 0.0
+
+    def _calculate_ndcg(self, recommendations, properties_df, actual_comp_ids, k):
+        """Calculate Normalized Discounted Cumulative Gain."""
+        dcg = 0.0
+        for rank, idx in enumerate(recommendations[:k], 1):
+            if idx < len(properties_df):
+                prop_address = properties_df.iloc[idx].get('address', '')
+                if prop_address in actual_comp_ids:
+                    dcg += 1.0 / np.log2(rank + 1)
+        
+        # Calculate ideal DCG (if all actual comps were ranked first)
+        idcg = sum(1.0 / np.log2(i + 2) for i in range(min(len(actual_comp_ids), k)))
+        
+        return dcg / idcg if idcg > 0 else 0.0
+
+    def _print_evaluation_report(self, metrics, k):
+        """Print a formatted evaluation report."""
+        print(f"\n{'='*60}")
+        print("EVALUATION RESULTS")
+        print(f"{'='*60}")
+        print(f"\n📊 Dataset Statistics:")
+        print(f"   • Total subjects evaluated: {metrics['total_subjects']}")
+        print(f"   • Avg comps per subject: {metrics['avg_comps_per_subject']:.2f}")
+        print(f"   • Subjects with at least 1 hit: {metrics['subjects_with_hits']}")
+        
+        print(f"\n🎯 Recommendation Quality (k={k}):")
+        print(f"   • Hit Rate: {metrics['hit_rate']*100:.2f}%")
+        print(f"     (% of subjects where ≥1 correct comp found)")
+        
+        print(f"\n   • Precision@{k}: {metrics.get('avg_precision_at_k', 0)*100:.2f}%")
+        print(f"     (% of recommendations that are correct)")
+        
+        print(f"\n   • Recall@{k}: {metrics.get('avg_recall_at_k', 0)*100:.2f}%")
+        print(f"     (% of actual comps found in top {k})")
+        
+        print(f"\n   • F1 Score: {metrics.get('f1_score', 0)*100:.2f}%")
+        print(f"     (Harmonic mean of precision and recall)")
+        
+        print(f"\n📈 Ranking Quality:")
+        print(f"   • Mean Reciprocal Rank (MRR): {metrics.get('avg_mrr', 0):.4f}")
+        print(f"     (How high the first correct comp ranks)")
+        
+        print(f"\n   • NDCG@{k}: {metrics.get('avg_ndcg_at_k', 0):.4f}")
+        print(f"     (Quality of ranking considering position)")
+        
+        print(f"\n{'='*60}")
+        
+        # Interpretation guide
+        print("\n📖 Interpretation Guide:")
+        if metrics['hit_rate'] >= 0.8:
+            print("   ✅ Hit Rate: Excellent - Model finds relevant comps most of the time")
+        elif metrics['hit_rate'] >= 0.5:
+            print("   ⚠️  Hit Rate: Moderate - Room for improvement")
+        else:
+            print("   ❌ Hit Rate: Low - Model needs significant improvement")
+            
+        if metrics.get('avg_mrr', 0) >= 0.5:
+            print("   ✅ MRR: Good - Correct comps rank highly")
+        else:
+            print("   ⚠️  MRR: Could improve - Correct comps not ranking high enough")
+
 def main():
     try:
         # Initialize recommender
@@ -282,6 +491,11 @@ def main():
             print(f"Error: Data file '{data_path}' not found.")
             print("Please ensure the appraisals_dataset.json file exists in the current directory.")
             return
+        
+        # Load raw data for evaluation
+        print("\nLoading raw data...")
+        with open(data_path, 'r') as f:
+            raw_data = json.load(f)
         
         # Load and split data
         print("\nLoading data...")
@@ -303,11 +517,25 @@ def main():
         print("\nTraining model...")
         recommender.train(train_subjects, properties_df)
         
-        # Evaluate on validation set
-        print("\nEvaluating on validation set...")
-        for i, (_, subject) in enumerate(val_subjects.iterrows(), 1):
-            print(f"\nProcessing subject {i}/{len(val_subjects)}")
-            print(f"Subject: {subject['address']}")
+        # Run comprehensive evaluation
+        print("\n" + "="*60)
+        print("RUNNING COMPREHENSIVE MODEL EVALUATION")
+        print("="*60)
+        
+        # Evaluate with different k values
+        for k in [3, 5, 10]:
+            print(f"\n>>> Evaluating with k={k}")
+            metrics = recommender.evaluate(subjects_df, properties_df, raw_data, k=k)
+        
+        # Sample predictions for validation set
+        print("\n" + "="*60)
+        print("SAMPLE PREDICTIONS (First 5 subjects)")
+        print("="*60)
+        
+        for i, (_, subject) in enumerate(val_subjects.head(5).iterrows(), 1):
+            print(f"\n{'─'*50}")
+            print(f"Subject {i}: {subject.get('address', 'N/A')}")
+            print(f"{'─'*50}")
             
             try:
                 comps = recommender.find_comps(
@@ -315,11 +543,11 @@ def main():
                     properties_df
                 )
                 
-                print("Comparable properties:")
+                print("Top comparable properties:")
                 for j, comp in enumerate(comps, 1):
-                    print(f"{j}. {comp['address']}")
-                    print(f"   Similarity: {comp['similarity_score']:.2f}")
-                    print(f"   Explanation: {comp['explanation']}")
+                    print(f"  {j}. {comp['address']}")
+                    print(f"     Similarity Score: {comp['similarity_score']:.4f}")
+                    print(f"     Reason: {comp['explanation']}")
                     
             except Exception as e:
                 print(f"Error processing subject {i}: {str(e)}")
